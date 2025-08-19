@@ -1,0 +1,580 @@
+import React, { useState, useEffect, useCallback } from 'react';
+
+// Helper function to call the LLM and parse the signal text
+const parseSignalWithAI = async (signalText) => {
+    try {
+        const prompt = `Extract the following information from the crypto signal text. Provide the output in JSON format with the following keys: 'coin', 'positionType' (either 'SHORT' or 'LONG'), 'entryMin', 'entryMax', 'leverage', 'targets' (an array of numbers), and 'stopLoss'. If any information is missing or unclear, set the corresponding value to null. The 'targets' should be an array of numbers, and 'entryMin', 'entryMax', 'leverage', 'stopLoss' should all be numbers.
+
+Signal Text:
+${signalText}`;
+
+        const chatHistory = [];
+        chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+
+        const payload = {
+            contents: chatHistory,
+            generationConfig: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: "OBJECT",
+                    properties: {
+                        "coin": { "type": "STRING" },
+                        "positionType": { "type": "STRING" },
+                        "entryMin": { "type": "NUMBER" },
+                        "entryMax": { "type": "NUMBER" },
+                        "leverage": { "type": "NUMBER" },
+                        "targets": {
+                            "type": "ARRAY",
+                            "items": { "type": "NUMBER" }
+                        },
+                        "stopLoss": { "type": "NUMBER" }
+                    },
+                    required: ["coin", "positionType", "entryMin", "entryMax", "leverage", "targets", "stopLoss"]
+                }
+            }
+        };
+
+        const apiKey = "AIzaSyBAiLmy-UUFbMmnif3wa0yw7yqvZTBkqw4"; // Updated API Key
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+        let response;
+        let result;
+        let retries = 0;
+        const maxRetries = 5;
+        const baseDelay = 1000; // 1 second
+
+        while (retries < maxRetries) {
+            try {
+                response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                result = await response.json();
+
+                if (result.candidates && result.candidates.length > 0 &&
+                    result.candidates[0].content && result.candidates[0].content.parts &&
+                    result.candidates[0].content.parts.length > 0) {
+                    const json = result.candidates[0].content.parts[0].text;
+                    const parsedJson = JSON.parse(json);
+                    return parsedJson;
+                } else {
+                    throw new Error("Unexpected API response structure.");
+                }
+            } catch (error) {
+                if (response && response.status === 429 && retries < maxRetries - 1) { // Too Many Requests
+                    const delay = baseDelay * Math.pow(2, retries);
+                    console.warn(`Rate limit hit, retrying in ${delay}ms...`);
+                    await new Promise(res => setTimeout(res, delay));
+                    retries++;
+                } else {
+                    throw error; // Re-throw if not a rate limit or max retries reached
+                }
+            }
+        }
+        throw new Error("Failed to get a valid response from the API after multiple retries.");
+
+    } catch (error) {
+        console.error("Error parsing signal with AI:", error);
+        return { error: `AI parsing failed: ${error.message}. Please check signal format.` };
+    }
+};
+
+// Main calculation logic, now taking parsed data
+const calculateProfitLoss = (parsedSignal, accountSize, selectedLeverage) => {
+    if (parsedSignal.error) {
+        return { error: parsedSignal.error };
+    }
+
+    const { coin, positionType, entryMin, entryMax, leverage, targets, stopLoss } = parsedSignal;
+
+    if (!coin || entryMin === null || entryMax === null || leverage === null || stopLoss === null || !targets || targets.length === 0 || !positionType) {
+        return { error: "Parsed signal is incomplete. Please ensure all details are present." };
+    }
+
+    const entryPrice = (entryMin + entryMax) / 2;
+    const initialInvestment = accountSize; // This is the collateral
+    // For futures, position size is collateral * leverage
+    const positionSize = initialInvestment * selectedLeverage; // Value of the assets being traded
+    const contractAmount = positionSize / entryPrice; // Number of coins/contracts
+
+    const results = {
+        coin,
+        entryPrice,
+        leverage: selectedLeverage, // Using selectedLeverage from user input
+        signalLeverage: leverage, // Storing original signal leverage
+        initialInvestment,
+        positionSize,
+        contractAmount,
+        positionType
+    };
+
+    const calculatePnL = (currentPrice) => {
+        let pnl = 0;
+        if (positionType === 'SHORT') {
+            // For a short position, profit increases as price decreases
+            pnl = (entryPrice - currentPrice) * contractAmount;
+        } else {
+            // For a long position, profit increases as price increases
+            pnl = (currentPrice - entryPrice) * contractAmount;
+        }
+        return pnl;
+    };
+
+    results.targets = targets.map((targetPrice) => ({
+        price: targetPrice,
+        pnl: calculatePnL(targetPrice)
+    }));
+
+    results.stopLoss = {
+        price: stopLoss,
+        pnl: calculatePnL(stopLoss)
+    };
+
+    return results;
+};
+
+
+const CryptoSignalCalculator = () => {
+    const [currentSignalText, setCurrentSignalText] = useState(`📍Coin : #HIFI/USDT
+
+🔴 SHORT 
+
+👉 Entry: 0.1363 - 0.1399
+
+🌐 Leverage: 20x
+
+🎯 Target 1: 0.1350
+🎯 Target 2: 0.1337
+🎯 Target 3: 0.1324
+🎯 Target 4: 0.1311
+🎯 Target 5: 0.1297
+🎯 Target 6: 0.1284
+
+❌ StopLoss: 0.1460`);
+    const [accountSize, setAccountSize] = useState(100); // Default account size
+    const [selectedLeverage, setSelectedLeverage] = useState(20); // Default leverage
+    const [signals, setSignals] = useState([]); // Array to store multiple signals
+    const [error, setError] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [totalProfitLoss, setTotalProfitLoss] = useState(0);
+    const [totalInitialInvestment, setTotalInitialInvestment] = useState(0); // New state for total initial investment
+
+    // Function to process and add a new signal
+    const addSignal = useCallback(async () => {
+        if (!currentSignalText.trim()) {
+            setError('Please paste a signal to add.');
+            return;
+        }
+        if (accountSize <= 0 || selectedLeverage <= 0) {
+            setError('Account size and leverage must be greater than zero.');
+            return;
+        }
+
+        setLoading(true);
+        setError('');
+
+        const parsedSignal = await parseSignalWithAI(currentSignalText);
+
+        if (parsedSignal.error) {
+            setError(parsedSignal.error);
+        } else {
+            const calculationResults = calculateProfitLoss(parsedSignal, accountSize, selectedLeverage);
+            if (calculationResults.error) {
+                setError(calculationResults.error);
+            } else {
+                // Determine initial hit price/pnl if possible, or default to first target
+                let initialHitPriceType = 'TP';
+                let initialHitPriceIndex = 0;
+                let initialHitPnl = calculationResults.targets.length > 0 ? calculationResults.targets[0].pnl : 0;
+
+                setSignals(prevSignals => [
+                    ...prevSignals,
+                    {
+                        id: Date.now(), // Unique ID for each signal
+                        signalText: currentSignalText,
+                        accountSize,
+                        selectedLeverage,
+                        parsedSignal,
+                        calculationResults,
+                        hitPriceType: initialHitPriceType,
+                        hitPriceIndex: initialHitPriceIndex,
+                        hitPnl: initialHitPnl,
+                        pnlPercentage: (initialHitPnl / accountSize) * 100 // Calculate initial P&L %
+                    }
+                ]);
+                setCurrentSignalText(''); // Clear input after adding
+            }
+        }
+        setLoading(false);
+    }, [currentSignalText, accountSize, selectedLeverage]);
+
+    // Effect to recalculate total P&L and percentages when signals or their hit status change
+    useEffect(() => {
+        const totalPnl = signals.reduce((sum, signal) => sum + signal.hitPnl, 0);
+        const totalInvest = signals.reduce((sum, signal) => sum + signal.accountSize, 0);
+        setTotalProfitLoss(totalPnl);
+        setTotalInitialInvestment(totalInvest);
+    }, [signals]);
+
+    // Handle change for hit TP/SL for a specific signal
+    const handleHitPriceChange = useCallback((id, type, index = null) => {
+        setSignals(prevSignals => prevSignals.map(signal => {
+            if (signal.id === id) {
+                let hitPnl = 0;
+                if (type === 'TP' && index !== null && signal.calculationResults.targets[index]) {
+                    hitPnl = signal.calculationResults.targets[index].pnl;
+                } else if (type === 'SL') {
+                    hitPnl = signal.calculationResults.stopLoss.pnl;
+                }
+                const pnlPercentage = (hitPnl / signal.accountSize) * 100; // Recalculate P&L %
+                return {
+                    ...signal,
+                    hitPriceType: type,
+                    hitPriceIndex: index,
+                    hitPnl: hitPnl,
+                    pnlPercentage: pnlPercentage
+                };
+            }
+            return signal;
+        }));
+    }, []);
+
+    // Remove a signal from the list
+    const removeSignal = useCallback((id) => {
+        setSignals(prevSignals => prevSignals.filter(signal => signal.id !== id));
+    }, []);
+
+    // Export functions
+    const exportToPdf = useCallback(() => {
+        const input = document.getElementById('signals-table-container');
+        if (!input) {
+            setError('Could not find table to export.');
+            return;
+        }
+
+        // Temporarily hide action column for cleaner PDF
+        const actionColumnHeader = input.querySelector('th:last-child');
+        const actionCells = input.querySelectorAll('td:last-child');
+        const originalHeaderDisplay = actionColumnHeader ? actionColumnHeader.style.display : '';
+        const originalCellsDisplay = Array.from(actionCells).map(cell => cell.style.display);
+
+        if (actionColumnHeader) actionColumnHeader.style.display = 'none';
+        actionCells.forEach(cell => cell.style.display = 'none');
+
+
+        html2canvas(input, { scale: 2, useCORS: true }).then(canvas => {
+            const imgData = canvas.toDataURL('image/png');
+            const pdf = new jspdf.jsPDF({
+                orientation: 'landscape',
+                unit: 'px',
+                format: 'a4'
+            });
+
+            const imgWidth = pdf.internal.pageSize.getWidth();
+            const imgHeight = (canvas.height * imgWidth) / canvas.width;
+            pdf.addImage(imgData, 'PNG', 0, 0, imgWidth, imgHeight);
+            pdf.save("crypto_signals_report.pdf");
+
+            // Restore original visibility
+            if (actionColumnHeader) actionColumnHeader.style.display = originalHeaderDisplay;
+            actionCells.forEach((cell, i) => cell.style.display = originalCellsDisplay[i]);
+        }).catch(err => {
+            console.error("Error generating PDF:", err);
+            setError("Failed to generate PDF. Please try again.");
+            // Ensure visibility is restored even on error
+            if (actionColumnHeader) actionColumnHeader.style.display = originalHeaderDisplay;
+            actionCells.forEach((cell, i) => cell.style.display = originalCellsDisplay[i]);
+        });
+    }, []);
+
+    const exportToExcel = useCallback(() => {
+        if (!signals.length) {
+            setError('No signals to export to Excel.');
+            return;
+        }
+
+        const data = [
+            ["Coin", "Entry Min", "Entry Max", "Account Size", "Leverage Used", "Position Type", "Hit Type", "Hit Price", "P&L (USDT)", "P&L (%)"]
+        ];
+
+        signals.forEach(signal => {
+            const hitPrice = signal.hitPriceType === 'SL'
+                ? signal.calculationResults.stopLoss.price
+                : signal.calculationResults.targets[signal.hitPriceIndex]?.price || 'N/A';
+
+            data.push([
+                signal.parsedSignal.coin,
+                signal.parsedSignal.entryMin,
+                signal.parsedSignal.entryMax,
+                signal.accountSize,
+                signal.selectedLeverage,
+                signal.parsedSignal.positionType,
+                signal.hitPriceType === 'SL' ? 'Stop Loss' : `Target ${signal.hitPriceIndex + 1}`,
+                hitPrice,
+                signal.hitPnl,
+                signal.pnlPercentage
+            ]);
+        });
+
+        data.push([]); // Empty row for separation
+        const totalPnlPercentage = totalInitialInvestment > 0 ? (totalProfitLoss / totalInitialInvestment) * 100 : 0;
+        data.push(["", "", "", "", "", "", "", "Total P&L:", totalProfitLoss, totalPnlPercentage]);
+
+
+        const ws = XLSX.utils.aoa_to_sheet(data);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Crypto Signals Report");
+        XLSX.writeFile(wb, "crypto_signals_report.xlsx");
+    }, [signals, totalProfitLoss, totalInitialInvestment]);
+
+    const exportToDoc = useCallback(() => {
+        if (!signals.length) {
+            setError('No signals to export to Doc.');
+            return;
+        }
+
+        let docContent = "Crypto Signals Report\n\n";
+        docContent += `Account Size per Signal (for calculations): ${accountSize} USDT\n`;
+        docContent += `Desired Leverage (for calculations): ${selectedLeverage}x\n`;
+        docContent += `Total Initial Investment Across Signals: ${totalInitialInvestment.toFixed(2)} USDT\n\n`;
+
+        signals.forEach((signal, index) => {
+            docContent += `--- Signal ${index + 1} ---\n`;
+            docContent += `Coin: ${signal.parsedSignal.coin}\n`;
+            docContent += `Position Type: ${signal.parsedSignal.positionType}\n`;
+            docContent += `Entry: ${signal.parsedSignal.entryMin.toFixed(4)} - ${signal.parsedSignal.entryMax.toFixed(4)}\n`;
+            docContent += `Leverage (Signal): ${signal.parsedSignal.signalLeverage}x\n`;
+            docContent += `Leverage (Used): ${signal.selectedLeverage}x\n`;
+            docContent += `Initial Investment for this Signal: ${signal.initialInvestment.toFixed(2)} USDT\n`;
+            docContent += `Position Size: ${signal.positionSize.toFixed(2)} USDT\n`;
+            docContent += `Contract Amount: ${signal.contractAmount.toFixed(4)} ${signal.parsedSignal.coin}\n`;
+
+            docContent += "Targets:\n";
+            signal.calculationResults.targets.forEach((tp, idx) => {
+                docContent += `- Target ${idx + 1}: ${tp.price.toFixed(4)} (P&L: ${tp.pnl.toFixed(2)} USDT)\n`;
+            });
+            docContent += `Stop Loss: ${signal.calculationResults.stopLoss.price.toFixed(4)} (P&L: ${signal.calculationResults.stopLoss.pnl.toFixed(2)} USDT)\n`;
+
+            const hitPrice = signal.hitPriceType === 'SL'
+                ? signal.calculationResults.stopLoss.price
+                : signal.calculationResults.targets[signal.hitPriceIndex]?.price || 'N/A';
+            const hitPriceLabel = signal.hitPriceType === 'SL' ? 'Stop Loss' : `Target ${signal.hitPriceIndex + 1}`;
+
+            docContent += `Outcome: ${hitPriceLabel} hit at ${hitPrice.toFixed(4)}\n`;
+            docContent += `Signal P&L: ${signal.hitPnl.toFixed(2)} USDT (${signal.pnlPercentage.toFixed(2)}%)\n\n`;
+        });
+
+        const totalPnlPercentage = totalInitialInvestment > 0 ? (totalProfitLoss / totalInitialInvestment) * 100 : 0;
+        docContent += `===================================\n`;
+        docContent += `TOTAL PROFIT/LOSS: ${totalProfitLoss.toFixed(2)} USDT (${totalPnlPercentage.toFixed(2)}%)\n`;
+        docContent += `===================================\n`;
+
+
+        const blob = new Blob([docContent], { type: 'text/plain;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'crypto_signals_report.doc'; // .doc extension for simple text doc
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+    }, [signals, accountSize, selectedLeverage, totalProfitLoss, totalInitialInvestment]);
+
+
+    return (
+        <div className="min-h-screen bg-gray-900 flex flex-col items-center justify-center p-4 font-inter text-gray-100">
+            {/* CDN links for styling and export libraries */}
+            <script src="https://cdn.tailwindcss.com"></script>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+
+            <div className="flex flex-col md:flex-row w-full max-w-7xl gap-6"> {/* Increased max-width */}
+                {/* Signals Table - Left side */}
+                {signals.length > 0 && (
+                    <div id="signals-table-container" className="bg-gray-800 rounded-xl shadow-2xl p-6 w-full md:w-1/2 border border-gray-700 mb-8 md:mb-0 transform hover:scale-[1.01] transition-transform duration-300 ease-in-out">
+                        <h2 className="text-3xl font-extrabold text-blue-400 mb-6 text-center">Active Signals Overview</h2>
+                        <div className="overflow-x-auto mb-6">
+                            <table className="min-w-full bg-gray-700 rounded-lg shadow-inner overflow-hidden">
+                                <thead className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white">
+                                    <tr>
+                                        <th className="py-3 px-4 text-left text-sm font-semibold uppercase tracking-wider rounded-tl-lg">Coin</th>
+                                        <th className="py-3 px-4 text-left text-sm font-semibold uppercase tracking-wider">Entry</th>
+                                        <th className="py-3 px-4 text-left text-sm font-semibold uppercase tracking-wider">Leverage</th>
+                                        <th className="py-3 px-4 text-left text-sm font-semibold uppercase tracking-wider">Position</th>
+                                        <th className="py-3 px-4 text-left text-sm font-semibold uppercase tracking-wider">Hit Price / P&L (USDT)</th>
+                                        <th className="py-3 px-4 text-left text-sm font-semibold uppercase tracking-wider">P&L (%)</th> {/* New column header */}
+                                        <th className="py-3 px-4 text-left text-sm font-semibold uppercase tracking-wider rounded-tr-lg">Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-600">
+                                    {signals.map((signal, index) => (
+                                        <tr key={signal.id} className={`${index % 2 === 0 ? 'bg-gray-700' : 'bg-gray-750'} hover:bg-gray-600 transition-colors duration-200 ease-in-out`}>
+                                            <td className="py-3 px-4 text-blue-300 font-medium">{signal.parsedSignal.coin}</td>
+                                            <td className="py-3 px-4 text-gray-200">{signal.parsedSignal.entryMin.toFixed(4)} - {signal.parsedSignal.entryMax.toFixed(4)}</td>
+                                            <td className="py-3 px-4 text-gray-200">{signal.selectedLeverage}x</td>
+                                            <td className="py-3 px-4 text-gray-200">{signal.parsedSignal.positionType}</td>
+                                            <td className="py-3 px-4">
+                                                <select
+                                                    value={signal.hitPriceType === 'SL' ? 'SL' : `TP-${signal.hitPriceIndex}`}
+                                                    onChange={(e) => {
+                                                        const [type, index] = e.target.value.split('-');
+                                                        handleHitPriceChange(signal.id, type, index ? parseInt(index, 10) : null);
+                                                    }}
+                                                    className="block w-full rounded-md border border-gray-600 bg-gray-800 text-gray-200 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 transition-all duration-200"
+                                                >
+                                                    {signal.calculationResults.targets.map((tp, idx) => (
+                                                        <option key={`tp-${idx}`} value={`TP-${idx}`}>
+                                                            Target {idx + 1} ({tp.price.toFixed(4)} | P&L: {tp.pnl.toFixed(2)})
+                                                        </option>
+                                                    ))}
+                                                    <option value="SL">
+                                                        Stop Loss ({signal.calculationResults.stopLoss.price.toFixed(4)} | P&L: {signal.calculationResults.stopLoss.pnl.toFixed(2)})
+                                                    </option>
+                                                </select>
+                                                <p className={`text-sm mt-1 ${signal.hitPnl >= 0 ? 'text-green-400' : 'text-red-400'} font-semibold`}>
+                                                    Actual P&L: {signal.hitPnl.toFixed(2)} USDT
+                                                </p>
+                                            </td>
+                                            <td className={`py-3 px-4 ${signal.pnlPercentage >= 0 ? 'text-green-400' : 'text-red-400'} font-semibold`}> {/* Display P&L % */}
+                                                {signal.pnlPercentage.toFixed(2)}%
+                                            </td>
+                                            <td className="py-3 px-4">
+                                                <button
+                                                    onClick={() => removeSignal(signal.id)}
+                                                    className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-3 rounded-lg shadow-md transition duration-200 ease-in-out text-sm transform hover:scale-105"
+                                                >
+                                                    Remove
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                        <div className="text-right text-3xl font-bold text-gray-100 mt-8 p-4 bg-gray-700 rounded-lg shadow-inner border border-gray-600">
+                            Total Profit/Loss: <span className={`${totalProfitLoss >= 0 ? 'text-green-400' : 'text-red-400'}`}>{totalProfitLoss.toFixed(2)} USDT</span>
+                            {totalInitialInvestment > 0 && (
+                                <p className={`text-xl mt-2 ${totalProfitLoss >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                    ({((totalProfitLoss / totalInitialInvestment) * 100).toFixed(2)}%)
+                                </p>
+                            )}
+                        </div>
+
+                        {/* Export Buttons */}
+                        <div className="mt-8 flex flex-col sm:flex-row justify-center gap-4">
+                            <button
+                                onClick={exportToPdf}
+                                disabled={!signals.length}
+                                className="flex items-center justify-center bg-purple-700 hover:bg-purple-800 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition duration-200 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105"
+                            >
+                                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 13h6m-3-3v6m5 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                                Export to PDF
+                            </button>
+                            <button
+                                onClick={exportToExcel}
+                                disabled={!signals.length}
+                                className="flex items-center justify-center bg-green-700 hover:bg-green-800 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition duration-200 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105"
+                            >
+                                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                Export to Excel
+                            </button>
+                            <button
+                                onClick={exportToDoc}
+                                disabled={!signals.length}
+                                className="flex items-center justify-center bg-yellow-700 hover:bg-yellow-800 text-white font-bold py-3 px-6 rounded-lg shadow-lg transition duration-200 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105"
+                            >
+                                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                                Export to Doc
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {/* Calculator Inputs - Right side */}
+                <div className="bg-gray-800 rounded-xl shadow-2xl p-6 w-full md:w-1/2 border border-gray-700 transform hover:scale-[1.01] transition-transform duration-300 ease-in-out">
+                    <h1 className="text-3xl font-extrabold text-blue-400 mb-6 text-center">Crypto Signal P&L Calculator (AI Powered)</h1>
+
+                    {/* Account Size and Leverage Inputs */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                        <div>
+                            <label htmlFor="accountSize" className="block text-sm font-medium text-gray-300 mb-2">
+                                Account Size (USDT):
+                            </label>
+                            <input
+                                type="number"
+                                id="accountSize"
+                                className="w-full p-3 border border-gray-600 rounded-lg shadow-inner bg-gray-700 text-gray-100 focus:ring-blue-500 focus:border-blue-500 transition duration-150 ease-in-out"
+                                value={accountSize}
+                                onChange={(e) => setAccountSize(Number(e.target.value))}
+                                min="0"
+                                step="any"
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="leverage" className="block text-sm font-medium text-gray-300 mb-2">
+                                Desired Leverage (x):
+                            </label>
+                            <input
+                                type="number"
+                                id="leverage"
+                                className="w-full p-3 border border-gray-600 rounded-lg shadow-inner bg-gray-700 text-gray-100 focus:ring-blue-500 focus:border-blue-500 transition duration-150 ease-in-out"
+                                value={selectedLeverage}
+                                onChange={(e) => setSelectedLeverage(Number(e.target.value))}
+                                min="1"
+                                step="1"
+                            />
+                        </div>
+                    </div>
+
+                    {/* Signal Input */}
+                    <div className="mb-6">
+                        <label htmlFor="currentSignalText" className="block text-sm font-medium text-gray-300 mb-2">
+                            Paste New Crypto Signal Here:
+                        </label>
+                        <textarea
+                            id="currentSignalText"
+                            className="w-full p-3 border border-gray-600 rounded-lg shadow-inner bg-gray-700 text-gray-100 focus:ring-blue-500 focus:border-blue-500 transition duration-150 ease-in-out"
+                            rows="6"
+                            value={currentSignalText}
+                            onChange={(e) => setCurrentSignalText(e.target.value)}
+                            placeholder="e.g., 📍Coin : #BTC/USDT&#10;LONG&#10;👉 Entry: 30000 - 30500&#10;🌐 Leverage: 10x&#10;🎯 Target 1: 31000&#10;❌ StopLoss: 29500"
+                        ></textarea>
+                    </div>
+                    <button
+                        onClick={addSignal}
+                        disabled={loading}
+                        className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold py-3 px-4 rounded-lg shadow-lg transition duration-200 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-105"
+                    >
+                        {loading ? (
+                            <div className="flex items-center justify-center">
+                                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                Adding Signal...
+                            </div>
+                        ) : 'Add Signal'}
+                    </button>
+
+                    {/* Loading and Error Display */}
+                    {loading && (
+                        <div className="bg-blue-900 border border-blue-600 text-blue-200 px-4 py-3 rounded-lg relative mt-6 animate-pulse" role="status">
+                            <span className="block sm:inline ml-2">Parsing signal with AI... Please wait.</span>
+                        </div>
+                    )}
+                    {error && !loading && (
+                        <div className="bg-red-900 border border-red-600 text-red-200 px-4 py-3 rounded-lg relative mt-6" role="alert">
+                            <strong className="font-bold">Error:</strong>
+                            <span className="block sm:inline ml-2">{error}</span>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default CryptoSignalCalculator;
